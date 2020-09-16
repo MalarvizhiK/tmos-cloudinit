@@ -1,0 +1,14 @@
+{
+    "thread_pool_size": 100,
+    "report_service_base_url": "",
+    "report_request_frequency": 30,
+    "test_timeout": 500000,
+    "preserve_timed_out_instances": true,
+    "preserve_errored_instances": true,
+    "keep_completed_state": false,
+    "api_key": "",
+    "workspace_create_timeout": 48000,
+    "workspace_plan_timeout": 120000,
+    "workspace_apply_timeout": 180000,
+    "workspace_delete_timeout": 180000
+}
