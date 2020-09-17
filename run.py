@@ -48,7 +48,7 @@ AUTH_ENDPOINT = 'https://iam.cloud.ibm.com/identity/token'
 SESSION_TOKEN = None
 REFRESH_TOKEN = None
 SESSION_TIMESTAMP = 0
-SESSION_SECONDS = 300
+
 REQUEST_RETRIES = 10
 REQUEST_DELAY = 10
 
@@ -56,6 +56,10 @@ WORKSPACE_CREATE_TIMEOUT = 4800
 WORKSPACE_PLAN_TIMEOUT = 600
 WORKSPACE_APPLY_TIMEOUT = 600
 WORKSPACE_DELETE_TIMEOUT = 600
+WORKSPACE_RETRY_INTERVAL = 10
+WORKSPACE_STATUS_POLL_INTERVAL = 10
+
+REPORT_REQUEST_INTERVAL = 30
 
 CONFIG_FILE = "%s/runners-config.json" % SCRIPT_DIR
 CONFIG = {}
@@ -113,13 +117,13 @@ def poll_report(test_id):
         seconds_left = int(end_time - time.time())
         LOG.debug('test_id: %s with %s seconds left',
                   test_id, str(seconds_left))
-        time.sleep(CONFIG['report_request_frequency'])
+        time.sleep(REPORT_REQUEST_INTERVAL)
     return None
+
 
 def get_iam_token():
     global SESSION_TOKEN, REFRESH_TOKEN, SESSION_TIMESTAMP
-    now = int(time.time())
-    if SESSION_TIMESTAMP > 0 and ((now - SESSION_TIMESTAMP) < SESSION_SECONDS):
+    if SESSION_TIMESTAMP > 0 and ((SESSION_TIMESTAMP - int(time.time())) > 60):
         return SESSION_TOKEN
     headers = {
         "Accept": "application/json",
@@ -130,29 +134,30 @@ def get_iam_token():
     try:
         response = requests.post(AUTH_ENDPOINT, headers=headers, data=data)
         if response.status_code < 300:
-            SESSION_TIMESTAMP = int(time.time())
             response_json = response.json()
+            SESSION_TIMESTAMP = (int(time.time()) + int(response_json['expires_in']))
             SESSION_TOKEN = response_json['access_token']
             REFRESH_TOKEN = response_json['refresh_token']
             return SESSION_TOKEN
         else:
             LOG.error('could not get an access token %d - %s',
-                      response.status_code, response.content)
+                    response.status_code, response.content)
+            SESSION_TIMESTAMP = 0
             return None
-    except Exception as pe:
-        # mkm - changed
-        LOG.error('exception while getting IAM token  %s - %s', pe, response.status_code)
+    except Exception as te:
+        LOG.error('exception while getting IAM token %s - %s', te, response.status_code)
+        SESSION_TIMESTAMP = 0
         return None
-
 
 
 def get_refresh_token():
     now = int(time.time())
-    if SESSION_TIMESTAMP > 0 and ((now - SESSION_TIMESTAMP) < SESSION_SECONDS):
+    if SESSION_TIMESTAMP > 0 and ((SESSION_TIMESTAMP - int(time.time())) > 60):
         return REFRESH_TOKEN
     else:
         get_iam_token()
         return REFRESH_TOKEN
+
 
 def poll_workspace_until(url, statuses, timeout):
     w_id = os.path.basename(url)
@@ -169,6 +174,12 @@ def poll_workspace_until(url, statuses, timeout):
                 "refresh_token": refresh_token
             }
             response = requests.get(url, headers=headers)
+            while response.status_code == 429:
+                LOG.debug('exceeded throttling limit.. retrying')
+                time.sleep(WORKSPACE_RETRY_INTERVAL)
+                response = requests.post(url, headers=headers)
+                LOG.info('polling workspace returned %d for %s',
+                         response.status_code, url)
             if response.status_code < 400:
                 response_json = response.json()
                 if response_json['status'].lower() in statuses:
@@ -177,21 +188,17 @@ def poll_workspace_until(url, statuses, timeout):
                     return response_json['status']
                 else:
                     LOG.debug('polling workspace %s interim status %s',
-                             w_id, response_json['status'])
+                              w_id, response_json['status'])
 
         except Exception as pe:
-            # mkm - changed
-            if response.status_code == 200:
-                LOG.warning('Warning  - Exceeds rate limit, %s - %s', w_id, pe)
-            else:
-                LOG.error('exception polling workspace %s - %s - %s', w_id, pe, response.status_code)
-                return False
-        time.sleep(20)
+            LOG.error('exception polling workspace %s - %s', w_id, pe)
+            return False
+        time.sleep(WORKSPACE_STATUS_POLL_INTERVAL)
     return False
 
 
 def create_workspace(test_id, url, data):
-    LOG.info('*** test_id %s', test_id)
+    LOG.info('creating Schematic workspace for %s', test_id)
     token = get_iam_token()
     refresh_token = get_refresh_token()
     headers = {
@@ -200,44 +207,41 @@ def create_workspace(test_id, url, data):
         "Authorization": "Bearer %s" % token,
         "refresh_token": refresh_token
     }
-    try :
-        LOG.info('*** Inside create_workspace, test_id %s', test_id)
-        response = requests.post(url, headers=headers, data=json.dumps(data))
+    response = requests.post(url, headers=headers, data=json.dumps(data))
+    LOG.info('workspace create returned %d for %s',
+             response.status_code, test_id)
+    while response.status_code == 429:
+        LOG.debug('exceeded throttling limit.. retrying')
+        time.sleep(WORKSPACE_RETRY_INTERVAL)
+        response = requests.post(url, headers=headers)
         LOG.info('workspace create returned %d for %s',
                  response.status_code, test_id)
-        if response.status_code < 300:
-            workspace_id = response.json()['id']
-            LOG.info('*** workspace_id, test_id %s %s', workspace_id, test_id)
-            status_url = "%s/%s" % (url, workspace_id)
-            LOG.info('polling for workspace create to complete for %s', test_id)
-            status_returned = poll_workspace_until(
-                status_url, ['inactive', 'failed', 'template_error'], WORKSPACE_CREATE_TIMEOUT)
-            if status_returned:
-                if status_returned.lower() == 'inactive':
-                    return (workspace_id, status_returned)
-                elif status_returned.lower() == 'failed':
-                    time.sleep(10)
-                    LOG.info('sleep for 10 secs and retry updating same workspace %s returned status %s ',
-                              workspace_id, status_returned)
-                    # mkm-changed
-                    #retry create workspace only once
-                    return retry_create_workspace(workspace_id, test_id, url, data)
-
-                else:
-                    LOG.error('workspace %s returned status %s - failed to create',
-                              workspace_id, status_returned)
-                    return (None, "created workspace %s returned status %s" % (workspace_id, status_returned))
+    if response.status_code < 300:
+        workspace_id = response.json()['id']
+        status_url = "%s/%s" % (url, workspace_id)
+        LOG.info('polling for workspace create to complete for %s', test_id)
+        status_returned = poll_workspace_until(
+            status_url, ['inactive', 'failed', 'template_error'], WORKSPACE_CREATE_TIMEOUT)
+        if status_returned:
+            if status_returned.lower() == 'inactive':
+                return (workspace_id, status_returned)
+            elif status_returned.lower() == 'failed':
+                time.sleep(10)
+                LOG.info('sleep for 10 secs and retry updating same workspace %s returned status %s ',
+                          workspace_id, status_returned)
+                # MK-changed
+                #retry create workspace only once
+                return retry_create_workspace(workspace_id, test_id, url, data)
             else:
-                return (None, "create reqeust to %s timed-out" % url)
+                LOG.error('workspace %s returned status %s - failed to create',
+                          workspace_id, status_returned)
+                return (None, "created workspace %s returned status %s" % (workspace_id, status_returned))
         else:
-            return (None, 'could not create workspace for %s - %d - %s' % (test_id, response.status_code, response.text))
-    except Exception as pe:
-        # mkm - changed
-        LOG.error('*** exception creating workspace %s - %s - %s', test_id, pe, response.status_code)
+            return (None, "create reqeust to %s timed-out" % url)
+        return (None, 'could not create workspace for %s - %d - %s' % (test_id, response.status_code, response.text))
 
-
-def retry_create_workspace(workspace_id, test_id, url, data):
-    LOG.info('Retry create Schematic workspace for %s', test_id)
+def retry_create_workspace(test_id, url, data):
+    LOG.info('retry create Schematic workspace for %s', test_id)
     token = get_iam_token()
     refresh_token = get_refresh_token()
     headers = {
@@ -246,10 +250,15 @@ def retry_create_workspace(workspace_id, test_id, url, data):
         "Authorization": "Bearer %s" % token,
         "refresh_token": refresh_token
     }
-    url = url + "/" + workspace_id
     response = requests.put(url, headers=headers, data=json.dumps(data))
-    LOG.info('workspace create retry returned %d for %s',
+    LOG.info('workspace retry create returned %d for %s',
              response.status_code, test_id)
+    while response.status_code == 429:
+        LOG.debug('exceeded throttling limit.. retrying')
+        time.sleep(WORKSPACE_RETRY_INTERVAL)
+        response = requests.put(url, headers=headers)
+        LOG.info('workspace create returned %d for %s',
+                 response.status_code, test_id)
     if response.status_code < 300:
         workspace_id = response.json()['id']
         status_url = "%s/%s" % (url, workspace_id)
@@ -265,68 +274,11 @@ def retry_create_workspace(workspace_id, test_id, url, data):
                 return (None, "created workspace %s returned status %s" % (workspace_id, status_returned))
         else:
             return (None, "create reqeust to %s timed-out" % url)
-    else:
-        return (None, 'could not create workspace retry for %s - %d - %s' % (test_id, response.status_code, response.text))
+        return (None, 'could not create workspace for %s - %d - %s' % (test_id, response.status_code, response.text))
+
 
 def do_plan(test_id, url, workspace_id):
     LOG.info('planning Schematic workspace for %s', test_id)
-    plan_url = "%s/%s/plan" % (url, workspace_id)
-    token = get_iam_token()
-    refresh_token = get_refresh_token()
-    headers = {
-        "Accept": "application/json",
-        "Content-Type": "application/json",
-        "Authorization": "Bearer %s" % token,
-        "refresh_token": refresh_token
-    }
-    try:
-        response = requests.post(plan_url, headers=headers)
-        LOG.info('workspace plan returned %d for %s', response.status_code, test_id)
-        while response.status_code == 409:
-            LOG.debug('workspace locked.. retrying')
-            time.sleep(10)
-            response = requests.post(plan_url, headers=headers)
-            LOG.info('workspace plan returned %d for %s', response.status_code, test_id)
-        if response.status_code < 300:
-            activity_id = response.json()['activityid']
-            status_url = "%s/%s" % (url, workspace_id)
-            LOG.info('polling for workspace plan to initiate for %s', test_id)
-            status_returned = poll_workspace_until(
-            status_url, ['inprogress', 'failed'], WORKSPACE_PLAN_TIMEOUT
-            )
-            if status_returned:
-            	if status_returned.lower() == 'failed':
-                    status_message = "workspace %s plan with activity_id %s returned status %s" % (
-                    workspace_id, activity_id, status_returned)
-                    return (None, status_message)
-            	else:
-                    LOG.info('polling for workspace plan to complete for %s', test_id)
-                    status_returned = poll_workspace_until(
-                    status_url, ['inactive', 'failed'], WORKSPACE_PLAN_TIMEOUT)
-                    if status_returned:
-                    	if status_returned.lower() == 'inactive':
-                             return (activity_id, status_returned)
-                    	else:
-                             status_message = "workspace %s plan with activity_id %s returned status %s" % (
-                             workspace_id, activity_id, status_returned)
-                             return (None, status_message)
-                    else:
-                         status_message = "workspace %s plan timed-out" % plan_url
-                         return (None, status_message)
-            else:
-                return (None, 'could not plan workspace for %s - %d - %s' %
-                	(test_id, response.status_code, response.text))
-    except Exception as pe:
-        if response.status_code == 200:
-            LOG.warning('Warning  - do_plan() - Exceeds rate limit, %s - %s', w_id, pe)
-            time.sleep(10)
-            retry_do_plan(test_id, url, workspace_id)
-        else:
-            LOG.error('do_plan() - exception polling workspace %s - %s - %s', w_id, pe, response.status_code)
-            return False    		
-            
-def retry_do_plan(test_id, url, workspace_id):
-    LOG.info('Retrying Plan action as we execeeded the allowed limit - Schematic workspace for %s', test_id)
     plan_url = "%s/%s/plan" % (url, workspace_id)
     token = get_iam_token()
     refresh_token = get_refresh_token()
@@ -341,10 +293,74 @@ def retry_do_plan(test_id, url, workspace_id):
              response.status_code, test_id)
     while response.status_code == 409:
         LOG.debug('workspace locked.. retrying')
-        time.sleep(10)
+        time.sleep(WORKSPACE_RETRY_INTERVAL)
         response = requests.post(plan_url, headers=headers)
         LOG.info('workspace plan returned %d for %s',
-                 	response.status_code, test_id)
+                 response.status_code, test_id)
+    while response.status_code == 429:
+        LOG.debug('exceeded throttling limit.. retrying')
+        time.sleep(WORKSPACE_RETRY_INTERVAL)
+        response = requests.post(plan_url, headers=headers)
+        LOG.info('workspace plan returned %d for %s',
+                 response.status_code, test_id)
+    if response.status_code < 300:
+        activity_id = response.json()['activityid']
+        status_url = "%s/%s" % (url, workspace_id)
+        LOG.info('polling for workspace plan to initiate for %s', test_id)
+        status_returned = poll_workspace_until(
+            status_url, ['inprogress', 'failed'], WORKSPACE_PLAN_TIMEOUT
+        )
+        if status_returned:
+            if status_returned.lower() == 'failed':
+                time.sleep(10)
+                retry_do_plan(test_id, url, workspace_id)
+            else:
+                LOG.info('polling for workspace plan to complete for %s', test_id)
+                status_returned = poll_workspace_until(
+                    status_url, ['inactive', 'failed'], WORKSPACE_PLAN_TIMEOUT)
+                if status_returned:
+                    if status_returned.lower() == 'inactive':
+                        return (activity_id, status_returned)
+                    else:
+                        status_message = "workspace %s plan with activity_id %s returned status %s" % (
+                            workspace_id, activity_id, status_returned)
+                        log = get_log(url, workspace_id, activity_id)
+                        update_log = {"terraform_plan_log": log}
+                        update_report(test_id, update_log)
+                        return (None, status_message)
+                else:
+                    status_message = "workspace %s plan timed-out" % plan_url
+                    return (None, status_message)
+    else:
+        return (None, 'could not plan workspace for %s - %d - %s' %
+                (test_id, response.status_code, response.text))
+
+def retry_do_plan(test_id, url, workspace_id):
+    LOG.info('retry do_plan() planning Schematic workspace for %s', test_id)
+    plan_url = "%s/%s/plan" % (url, workspace_id)
+    token = get_iam_token()
+    refresh_token = get_refresh_token()
+    headers = {
+        "Accept": "application/json",
+        "Content-Type": "application/json",
+        "Authorization": "Bearer %s" % token,
+        "refresh_token": refresh_token
+    }
+    response = requests.post(plan_url, headers=headers)
+    LOG.info('workspace plan returned %d for %s',
+             response.status_code, test_id)
+    while response.status_code == 409:
+        LOG.debug('workspace locked.. retrying')
+        time.sleep(WORKSPACE_RETRY_INTERVAL)
+        response = requests.post(plan_url, headers=headers)
+        LOG.info('workspace plan returned %d for %s',
+                 response.status_code, test_id)
+    while response.status_code == 429:
+        LOG.debug('exceeded throttling limit.. retrying')
+        time.sleep(WORKSPACE_RETRY_INTERVAL)
+        response = requests.post(plan_url, headers=headers)
+        LOG.info('workspace plan returned %d for %s',
+                 response.status_code, test_id)
     if response.status_code < 300:
         activity_id = response.json()['activityid']
         status_url = "%s/%s" % (url, workspace_id)
@@ -356,6 +372,9 @@ def retry_do_plan(test_id, url, workspace_id):
             if status_returned.lower() == 'failed':
                 status_message = "workspace %s plan with activity_id %s returned status %s" % (
                     workspace_id, activity_id, status_returned)
+                log = get_log(url, workspace_id, activity_id)
+                update_log = {"terraform_plan_log": log}
+                update_report(test_id, update_log)
                 return (None, status_message)
             else:
                 LOG.info('polling for workspace plan to complete for %s', test_id)
@@ -367,6 +386,9 @@ def retry_do_plan(test_id, url, workspace_id):
                     else:
                         status_message = "workspace %s plan with activity_id %s returned status %s" % (
                             workspace_id, activity_id, status_returned)
+                        log = get_log(url, workspace_id, activity_id)
+                        update_log = {"terraform_plan_log": log}
+                        update_report(test_id, update_log)
                         return (None, status_message)
                 else:
                     status_message = "workspace %s plan timed-out" % plan_url
@@ -375,56 +397,9 @@ def retry_do_plan(test_id, url, workspace_id):
         return (None, 'could not plan workspace for %s - %d - %s' %
                 (test_id, response.status_code, response.text))
 
+
 def do_apply(test_id, url, workspace_id):
     LOG.info('applying Schematic workspace for %s', test_id)
-    apply_url = "%s/%s/apply" % (url, workspace_id)
-    token = get_iam_token()
-    refresh_token = get_refresh_token()
-    headers = {
-        "Accept": "application/json",
-        "Content-Type": "application/json",
-        "Authorization": "Bearer %s" % token,
-        "refresh_token": refresh_token
-    }
-    try: 
-        response = requests.put(apply_url, headers=headers)
-        LOG.info('workspace apply returned %d for %s', response.status_code, test_id)
-        while response.status_code == 409:
-            if response.status_code == 409:
-                LOG.debug('workspace locked.. retrying')
-            time.sleep(10)
-            response = requests.post(apply_url, headers=headers)
-            LOG.info('workspace apply returned %d for %s', response.status_code, test_id)
-        if response.status_code < 300:
-            activity_id = response.json()['activityid']
-            status_url = "%s/%s" % (url, workspace_id)
-            LOG.info('polling for workspace apply to complete for %s', test_id)
-            status_returned = poll_workspace_until(
-            status_url, ['active', 'failed'], WORKSPACE_APPLY_TIMEOUT)
-            if status_returned:
-                if status_returned.lower() == 'active':
-                    return (activity_id, status_returned)
-                else:
-                    status_message = "workspace %s apply with activity_id %s returned status %s" % (
-                    workspace_id, activity_id, status_returned)
-                    return (None, status_message)
-            else:
-                status_message = "workspace %s apply timed-out" % apply_url
-                return (None, status_message)
-        else:
-            LOG.error('could not apply workspace for %s - %d - %s', test_id, response.status_code, response.text)
-            return (None, 'could not apply workspace for %s - %d - %s' % (test_id, response.status_code, response.text))
-    except Exception as pe:
-        if response.status_code == 200:
-            LOG.warning('Warning  - do_apply() - Exceeds rate limit, %s - %s', w_id, pe)
-            time.sleep(10)
-            retry_do_apply(test_id, url, workspace_id)
-        else:
-            LOG.error('do_apply() - exception polling workspace %s - %s - %s', w_id, pe, response.status_code)
-            return False
-
-def retry_do_apply(test_id, url, workspace_id):
-    LOG.info('Retrying Apply action as we execeeded the allowed limit - Schematic workspace for %s', test_id)
     apply_url = "%s/%s/apply" % (url, workspace_id)
     token = get_iam_token()
     refresh_token = get_refresh_token()
@@ -440,8 +415,68 @@ def retry_do_apply(test_id, url, workspace_id):
     while response.status_code == 409:
         if response.status_code == 409:
             LOG.debug('workspace locked.. retrying')
-        time.sleep(10)
-        response = requests.post(apply_url, headers=headers)
+        time.sleep(WORKSPACE_RETRY_INTERVAL)
+        response = requests.put(apply_url, headers=headers)
+        LOG.info('workspace apply returned %d for %s',
+                 response.status_code, test_id)
+    while response.status_code == 429:
+        LOG.debug('exceeded throttling limit.. retrying')
+        time.sleep(WORKSPACE_RETRY_INTERVAL)
+        response = requests.put(apply_url, headers=headers)
+        LOG.info('workspace apply returned %d for %s',
+                 response.status_code, test_id)
+    if response.status_code < 300:
+        activity_id = response.json()['activityid']
+        status_url = "%s/%s" % (url, workspace_id)
+        LOG.info('polling for workspace apply to complete for %s', test_id)
+        status_returned = poll_workspace_until(
+            status_url, ['active', 'failed'], WORKSPACE_APPLY_TIMEOUT)
+        if status_returned:
+            if status_returned.lower() == 'active':
+                return (activity_id, status_returned)
+            elif status_returned.lower() == 'failed':
+                time.sleep(10)
+                retry_do_apply(test_id, url, workspace_id)
+            else:
+                status_message = "workspace %s apply with activity_id %s returned status %s" % (workspace_id, activity_id, status_returned)
+                log = get_log(url, workspace_id, activity_id)
+                update_log = {"terraform_apply_log": log}
+                update_report(test_id, update_log)
+                return (None, status_message)
+        else:
+            status_message = "workspace %s apply timed-out" % apply_url
+            return (None, status_message)
+    else:
+        LOG.error('could not apply workspace for %s - %d - %s',
+                  test_id, response.status_code, response.text)
+        return (None, 'could not apply workspace for %s - %d - %s' %
+                (test_id, response.status_code, response.text))
+
+def retry_do_apply(test_id, url, workspace_id):
+    LOG.info('retry do applying Schematic workspace for %s', test_id)
+    apply_url = "%s/%s/apply" % (url, workspace_id)
+    token = get_iam_token()
+    refresh_token = get_refresh_token()
+    headers = {
+        "Accept": "application/json",
+        "Content-Type": "application/json",
+        "Authorization": "Bearer %s" % token,
+        "refresh_token": refresh_token
+    }
+    response = requests.put(apply_url, headers=headers)
+    LOG.info('workspace apply returned %d for %s',
+             response.status_code, test_id)
+    while response.status_code == 409:
+        if response.status_code == 409:
+            LOG.debug('workspace locked.. retrying')
+        time.sleep(WORKSPACE_RETRY_INTERVAL)
+        response = requests.put(apply_url, headers=headers)
+        LOG.info('workspace apply returned %d for %s',
+                 response.status_code, test_id)
+    while response.status_code == 429:
+        LOG.debug('exceeded throttling limit.. retrying')
+        time.sleep(WORKSPACE_RETRY_INTERVAL)
+        response = requests.put(apply_url, headers=headers)
         LOG.info('workspace apply returned %d for %s',
                  response.status_code, test_id)
     if response.status_code < 300:
@@ -456,6 +491,9 @@ def retry_do_apply(test_id, url, workspace_id):
             else:
                 status_message = "workspace %s apply with activity_id %s returned status %s" % (
                     workspace_id, activity_id, status_returned)
+                log = get_log(url, workspace_id, activity_id)
+                update_log = {"terraform_apply_log": log}
+                update_report(test_id, update_log)
                 return (None, status_message)
         else:
             status_message = "workspace %s apply timed-out" % apply_url
@@ -467,13 +505,14 @@ def retry_do_apply(test_id, url, workspace_id):
                 (test_id, response.status_code, response.text))
 
 
+
 def delete_workspace(url, workspace_id):
     LOG.info('deleting Schematic workspace for %s', workspace_id)
     status_url = "%s/%s" % (url, workspace_id)
     status_returned = poll_workspace_until(
-        status_url, ['inactive', 'active', 'failed'], WORKSPACE_DELETE_TIMEOUT)
+        status_url, ['inactive', 'active', 'failed', 'draft', 'template_error'], WORKSPACE_DELETE_TIMEOUT)
     delete_url = "%s/%s" % (url, workspace_id)
-    if status_returned.lower() == 'active':
+    if status_returned.lower() in ['active', 'draft', 'failed']:
         delete_url = "%s/%s/?destroyResources=true" % (url, workspace_id)
     token = get_iam_token()
     refresh_token = get_refresh_token()
@@ -483,55 +522,61 @@ def delete_workspace(url, workspace_id):
         "Authorization": "Bearer %s" % token,
         "refresh_token": refresh_token
     }
-	# Add Exception handling
-    try:
-        response = requests.delete(delete_url, headers=headers)
-        LOG.info('workspace delete returned %d for %s', response.status_code, workspace_id)
-        while response.status_code == 409:
-            LOG.debug('workspace locked.. retrying')
-            time.sleep(10)
-            response = requests.delete(delete_url, headers=headers)
-            LOG.info('workspace plan returned %d for %s', response.status_code, workspace_id)
-        if response.status_code < 300:
-            return True
-        else:
-            LOG.error('could not destroy workspace %s - %s - %s', workspace_id, response.status_code, response.text)
-    except Exception as pe:
-        if response.status_code == 200:
-            LOG.warning('Warning  - delete_workspace() - Exceeds rate limit, %s - %s', w_id, pe)
-            time.sleep(10)
-            retry_delete_workspace(test_id, url, workspace_id)
-        else:
-            LOG.error('delete_workspace() - exception polling workspace %s - %s - %s', w_id, pe, response.status_code)
-
-def retry_delete_workspace(url, workspace_id):
-    LOG.info('retrying deleting Schematic workspace for %s', workspace_id)
-    status_url = "%s/%s" % (url, workspace_id)
-    status_returned = poll_workspace_until(
-        status_url, ['inactive', 'active', 'failed'], WORKSPACE_DELETE_TIMEOUT)
-    delete_url = "%s/%s" % (url, workspace_id)
-    if status_returned.lower() == 'active':
-        delete_url = "%s/%s/?destroyResources=true" % (url, workspace_id)
-    token = get_iam_token()
-    refresh_token = get_refresh_token()
-    headers = {
-        "Accept": "application/json",
-        "Content-Type": "application/json",
-        "Authorization": "Bearer %s" % token,
-        "refresh_token": refresh_token
-    }
-	# Add Exception handling
     response = requests.delete(delete_url, headers=headers)
-    LOG.info('workspace delete returned %d for %s', response.status_code, workspace_id)
+    LOG.info('workspace delete returned %d for %s',
+             response.status_code, workspace_id)
     while response.status_code == 409:
         LOG.debug('workspace locked.. retrying')
-        time.sleep(10)
+        time.sleep(WORKSPACE_RETRY_INTERVAL)
         response = requests.delete(delete_url, headers=headers)
-        LOG.info('workspace plan returned %d for %s', response.status_code, workspace_id)
+        LOG.info('workspace delete returned %d for %s',
+                 response.status_code, workspace_id)
+    while response.status_code == 429:
+        LOG.debug('exceeded throttling limit.. retrying')
+        time.sleep(WORKSPACE_RETRY_INTERVAL)
+        response = requests.post(delete_url, headers=headers)
+        LOG.info('workspace delete returned %d for %s',
+                 response.status_code, delete_url)
     if response.status_code < 300:
         return True
     else:
-        LOG.error('could not destroy workspace %s - %s - %s', workspace_id, response.status_code, response.text)
+        time.sleep(10)
+        retry_delete_workspace(url, workspace_id)
+
+
+def retry_delete_workspace(url, workspace_id):
+    LOG.info('retry deleting Schematic workspace for %s', workspace_id)
+    status_url = "%s/%s" % (url, workspace_id)
+    delete_url = "%s/%s/?destroyResources=true" % (url, workspace_id)
+    token = get_iam_token()
+    refresh_token = get_refresh_token()
+    headers = {
+        "Accept": "application/json",
+        "Content-Type": "application/json",
+        "Authorization": "Bearer %s" % token,
+        "refresh_token": refresh_token
+    }
+    response = requests.delete(delete_url, headers=headers)
+    LOG.info('workspace delete returned %d for %s',
+             response.status_code, workspace_id)
+    while response.status_code == 409:
+        LOG.debug('workspace locked.. retrying')
+        time.sleep(WORKSPACE_RETRY_INTERVAL)
+        response = requests.delete(delete_url, headers=headers)
+        LOG.info('workspace delete returned %d for %s',
+                 response.status_code, workspace_id)
+    while response.status_code == 429:
+        LOG.debug('exceeded throttling limit.. retrying')
+        time.sleep(WORKSPACE_RETRY_INTERVAL)
+        response = requests.post(delete_url, headers=headers)
+        LOG.info('workspace delete returned %d for %s',
+                 response.status_code, delete_url)
+    if response.status_code < 300:
+        return True
+    else:
+        LOG.error('could not destroy workspace %s - %s - %s',
+                  workspace_id, response.status_code, response.text)
+
 
 def get_log(url, workspace_id, activity_id):
     log_url = "%s/%s/actions/%s/logs" % (url, workspace_id, activity_id)
@@ -544,6 +589,20 @@ def get_log(url, workspace_id, activity_id):
         "refresh_token": refresh_token
     }
     response = requests.get(log_url, headers=headers)
+    LOG.info('activity get log returned %d for %s',
+             response.status_code, activity_id)
+    while response.status_code == 409:
+        LOG.debug('workspace locked.. retrying')
+        time.sleep(WORKSPACE_RETRY_INTERVAL)
+        response = requests.delete(log_url, headers=headers)
+        LOG.info('activity get log returned %d for %s',
+                 response.status_code, activity_id)
+    while response.status_code == 429:
+        LOG.debug('exceeded throttling limit.. retrying')
+        time.sleep(WORKSPACE_RETRY_INTERVAL)
+        response = requests.post(log_url, headers=headers)
+        LOG.info('activity get log returned %d for %s',
+                 response.status_code, activity_id)
     if response.status_code < 300:
         log_json = response.json()
         log_url = log_json['templates'][0]['log_url']
@@ -571,18 +630,18 @@ def run_test(test_path):
     }
     (workspace_id, create_status) = create_workspace(test_id, url, data)
     if workspace_id:
-        start_report(test_id, start_data)
-        update_report(
-            test_id, {"workspace_id": workspace_id, "schematic_workspace_create_status": create_status})
         (plan_activity_id, plan_status) = do_plan(test_id, url, workspace_id)
         if plan_activity_id:
-            update_report(
-                test_id, {"workspace_id": workspace_id, "terraform_plan_status": create_status})
+            start_report(test_id, start_data)
+            update_report( test_id, {
+                "workspace_id": workspace_id,
+                "schematic_workspace_create_status": create_status,
+                "terraform_plan_status": create_status
+            })
             log = get_log(url, workspace_id, plan_activity_id)
             update_log = {"terraform_plan_log": log}
             update_report(test_id, update_log)
-            (apply_activity_id, apply_status) = do_apply(
-                test_id, url, workspace_id)
+            (apply_activity_id, apply_status) = do_apply(test_id, url, workspace_id)
             if apply_activity_id:
                 update_report(
                     test_id, {"workspace_id": workspace_id, "terraform_apply_status": apply_status})
@@ -744,7 +803,10 @@ def runner():
 
 
 def initialize():
-    global MY_PID, CONFIG, WORKSPACE_CREATE_TIMEOUT, WORKSPACE_PLAN_TIMEOUT, WORKSPACE_APPLY_TIMEOUT, WORKSPACE_DELETE_TIMEOUT
+    global MY_PID, CONFIG, WORKSPACE_CREATE_TIMEOUT, \
+        WORKSPACE_PLAN_TIMEOUT, WORKSPACE_APPLY_TIMEOUT, \
+        WORKSPACE_DELETE_TIMEOUT, WORKSPACE_STATUS_POLL_INTERVAL, \
+        WORKSPACE_RETRY_INTERVAL, REPORT_REQUEST_INTERVAL
     MY_PID = os.getpid()
     os.makedirs(QUEUE_DIR, exist_ok=True)
     os.makedirs(RUNNING_DIR, exist_ok=True)
@@ -763,6 +825,12 @@ def initialize():
         WORKSPACE_APPLY_TIMEOUT = config['workspace_apply_timeout']
     if 'workspace_delete_timeout' in config:
         WORKSPACE_DELETE_TIMEOUT = config['workspace_delete_timeout']
+    if 'workspace_status_poll_interval' in config:
+        WORKSPACE_STATUS_POLL_INTERVAL = config['workspace_status_poll_interval']
+    if 'workspace_retry_interval' in config:
+        WORKSPACE_RETRY_INTERVAL = config['workspace_retry_interval']
+    if 'report_request_interval' in config:
+        REPORT_REQUEST_INTERVAL = config['report_request_interval']
 
 
 if __name__ == "__main__":
